@@ -200,70 +200,109 @@ class CNKI:
     PAGE2_PRODUCTS = "CJFQ,CAPJ,ZHYX,CJTL,CDFD,CMFD,WBFD,CPFD,IPFD,CCND,SCSF,SCHF,SCSD,SNAD,CCJD,CJFN,CCVD"
 
     def _search_common(self, qj: dict, aside: str, pages: int,
-                       sort: str, search_from_url: str = SEARCH_PAGE) -> list:
-        """搜索共用流程：首页 boolSearch=true，翻页带 turnpage 令牌。"""
+                       sort: str, search_from_url: str = SEARCH_PAGE,
+                       start_page: int = 1) -> list:
+        """搜索共用流程：boolSearch=true 只用于第 1 页（搜索触发+拿 turnpage 令牌），
+        从 start_page 起取数全部用翻页形态（boolSearch=false + pageNum + 令牌）。
+
+        start_page + pages 定义页码范围：取 start_page 起共 pages 页。
+        start_page=1 时第 1 页既是搜索触发页也是取数页（少一次请求）。
+        """
         sort_code = SORT_CODES.get(sort, "PT")
         page1_sort = "" if sort == "time" else sort_code
         self.s.get(search_from_url, timeout=25)  # 预热拿 cookie
         rows = []
         turnpage = ""
 
-        def fetch_page(pg: int):
-            if pg == 1:
-                form = {
-                    "boolSearch": "true",
-                    "QueryJson": json.dumps(qj, ensure_ascii=False, separators=(",", ":")),
-                    "pageNum": "1", "pageSize": "20",
-                    "sortField": page1_sort,
-                    "sortType": "desc" if page1_sort else "",
-                    "dstyle": "listmode",
-                    "productStr": "", "aside": aside,
-                    "searchFrom": "资源范围：总库",
-                    "subject": "", "language": "", "uniplatform": "",
-                    "CurPage": "1",
-                }
-            else:
-                qj2 = dict(qj)
-                qj2["Products"] = self.PAGE2_PRODUCTS
-                qj2["SearchFrom"] = 4
-                form = {
-                    "boolSearch": "false",
-                    "QueryJson": json.dumps(qj2, ensure_ascii=False, separators=(",", ":")),
-                    "pageNum": str(pg), "pageSize": "20",
-                    "sortField": page1_sort or "PT", "sortType": "desc",
-                    "dstyle": "listmode",
-                    "boolSortSearch": "false",
-                    "productStr": "", "aside": "",
-                    "searchFrom": "资源范围：总库",
-                    "subject": "", "turnpage": turnpage,
-                    "language": "", "uniplatform": "",
-                }
+        def fetch_search_page(pg: int):
+            """搜索触发形态（boolSearch=true）：仅第 1 页有效。"""
+            form = {
+                "boolSearch": "true",
+                "QueryJson": json.dumps(qj, ensure_ascii=False, separators=(",", ":")),
+                "pageNum": "1", "pageSize": "20",
+                "sortField": page1_sort,
+                "sortType": "desc" if page1_sort else "",
+                "dstyle": "listmode",
+                "productStr": "", "aside": aside,
+                "searchFrom": "资源范围：总库",
+                "subject": "", "language": "", "uniplatform": "",
+                "CurPage": "1",
+            }
             return self._post_checked(GRID_URL, data=form, headers={
                 "Referer": search_from_url, "X-Requested-With": "XMLHttpRequest"})
 
-        # 第 1 页带自愈：空结果可能是 WAF 软封（200+暂无数据），主动过验后重试
-        page_rows = []
-        for attempt in range(3):
-            r = fetch_page(1)
-            page_rows = self._parse_rows(r.text)
-            if page_rows or "暂无数据" not in r.text:
-                break
-            self.log("  第 1 页空结果（疑似 WAF 软封），尝试过验后重试 ...")
-            try:
-                _solve(self.s, search_from_url, log=self.log)
-            except (CaptchaError, RuntimeError):
-                pass
-            time.sleep(1)
-        self.log(f"  第 1 页: {len(page_rows)} 条")
-        if not page_rows:
-            return []
-        rows.extend(page_rows)
+        def fetch_turn_page(pg: int):
+            """翻页形态（boolSearch=false + 令牌）：pageNum 任意页有效。"""
+            qj2 = dict(qj)
+            qj2["Products"] = self.PAGE2_PRODUCTS
+            qj2["SearchFrom"] = 4
+            form = {
+                "boolSearch": "false",
+                "QueryJson": json.dumps(qj2, ensure_ascii=False, separators=(",", ":")),
+                "pageNum": str(pg), "pageSize": "20",
+                "sortField": page1_sort or "PT", "sortType": "desc",
+                "dstyle": "listmode",
+                "boolSortSearch": "false",
+                "productStr": "", "aside": "",
+                "searchFrom": "资源范围：总库",
+                "subject": "", "turnpage": turnpage,
+                "language": "", "uniplatform": "",
+            }
+            return self._post_checked(GRID_URL, data=form, headers={
+                "Referer": search_from_url, "X-Requested-With": "XMLHttpRequest"})
+
+        def with_soft_ban_retry(fetch, pg: int):
+            """软封自愈：空结果可能是 WAF 软封（200+暂无数据），主动过验后重试。"""
+            for attempt in range(3):
+                r = fetch(pg)
+                page_rows = self._parse_rows(r.text)
+                if page_rows or "暂无数据" not in r.text:
+                    return page_rows, r
+                self.log("  空结果（疑似 WAF 软封），尝试过验后重试 ...")
+                try:
+                    _solve(self.s, search_from_url, log=self.log)
+                except (CaptchaError, RuntimeError):
+                    pass
+                time.sleep(1)
+            return page_rows, r
+
+        # 拿 turnpage 令牌：start_page=1 时第 1 页直接取数；否则先触发搜索不取数
+        r = fetch_search_page(1)
+        page_rows = self._parse_rows(r.text)
+        if start_page == 1:
+            page_rows, r = with_soft_ban_retry(fetch_search_page, 1) \
+                if not page_rows and "暂无数据" in r.text else (page_rows, r)
+            self.log(f"  第 1 页: {len(page_rows)} 条")
+            if not page_rows:
+                return []
+            rows.extend(page_rows)
+            pages_left = pages - 1
+        else:
+            pages_left = pages
+            # 搜索触发响应里必须带令牌；失败时带自愈重试
+            m = re.search(r'id="hidTurnPage"[^>]*value="([^"]*)"', r.text)
+            if not m:
+                r2 = None
+                for attempt in range(3):
+                    try:
+                        _solve(self.s, search_from_url, log=self.log)
+                    except (CaptchaError, RuntimeError):
+                        pass
+                    r2 = fetch_search_page(1)
+                    m = re.search(r'id="hidTurnPage"[^>]*value="([^"]*)"', r2.text)
+                    if m:
+                        break
+                    time.sleep(1)
+            if not m:
+                self.log("  未拿到翻页令牌，返回空")
+                return []
         m = re.search(r'id="hidTurnPage"[^>]*value="([^"]*)"', r.text)
         turnpage = m.group(1) if m else ""
 
-        for pg in range(2, pages + 1):
-            r = fetch_page(pg)
-            page_rows = self._parse_rows(r.text)
+        # 从 start_page（或第 2 页）起用翻页形态取数
+        first = start_page if start_page > 1 else 2
+        for pg in range(first, first + pages_left):
+            page_rows, r = with_soft_ban_retry(fetch_turn_page, pg)
             self.log(f"  第 {pg} 页: {len(page_rows)} 条")
             if not page_rows:
                 break
@@ -273,7 +312,8 @@ class CNKI:
             row["n"] = i
         return rows
 
-    def search(self, kw: str, pages: int = 1, field: str = "SU", sort: str = "time") -> list:
+    def search(self, kw: str, pages: int = 1, field: str = "SU", sort: str = "time",
+               start_page: int = 1) -> list:
         label = FIELD_LABEL.get(field, "主题")
         qj = {
             "Platform": "", "Resource": "CROSSDB", "Classid": "WD0FTY92", "Products": "",
@@ -286,9 +326,11 @@ class CNKI:
                          "BLZOG7CK,PWFIRAGL,NN3FJMUV,NLBO1Z6R",
             "Expands": {}, "View": "changeDBCh", "SearchFrom": 1,
         }
-        return self._search_common(qj, f"({label}：{kw})", pages, sort)
+        return self._search_common(qj, f"({label}：{kw})", pages, sort,
+                                   start_page=start_page)
 
-    def expert_search(self, expr: str, pages: int = 1, sort: str = "time") -> list:
+    def expert_search(self, expr: str, pages: int = 1, sort: str = "time",
+                      start_page: int = 1) -> list:
         """专业检索：知网检索表达式透传，如 TI='知识图谱' AND AU='刘峤'。"""
         qj = {
             "Platform": "", "Resource": "CROSSDB", "Classid": "WD0FTY92", "Products": "",
@@ -305,7 +347,7 @@ class CNKI:
             "Expands": {}, "View": "changeDBCh", "SearchFrom": 1,
         }
         return self._search_common(qj, f"({expr})", pages, sort,
-                                   search_from_url=EXPERT_PAGE)
+                                   search_from_url=EXPERT_PAGE, start_page=start_page)
 
     @staticmethod
     def _parse_rows(html: str) -> list:
